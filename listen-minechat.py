@@ -17,13 +17,17 @@ LOG_DTTM_TMPL = '%d-%m-%y %H:%M:%S'
 DEFAULT_LOG_DESCRIPTOR = aiowrap(sys.stdout.write)
 
 
-def decorate_log_file_descriptor(fd=None):
-    if fd is None:
+class LogFileDecorateException(Exception):
+    pass
+
+
+def decorate_log_file_descriptor(file_descriptor=None):
+    if file_descriptor is None:
         write = DEFAULT_LOG_DESCRIPTOR
     else:
-        if getattr(fd, 'write', None) is None:
-            raise Exception("There is no write in file descriptor")
-        write = fd.write
+        if not getattr(file_descriptor, 'write', None):
+            raise LogFileDecorateException("There is no write in file descriptor")
+        write = file_descriptor.write
 
     async def wrapper(s):
         await write(f"[{datetime.datetime.now().strftime(LOG_DTTM_TMPL)}] {s}\n")
@@ -32,49 +36,51 @@ def decorate_log_file_descriptor(fd=None):
 
 
 @contextlib.asynccontextmanager
-async def open_connection(server, port, rf_writer):
+async def open_connection(server, port, message_writer):
     attempt = 0
     connected = False
     reader, writer = None, None
     while True:
         try:
             reader, writer = await asyncio.open_connection(server, port)
-            await rf_writer("Соединение установлено")
+            await message_writer("Соединение установлено")
             connected = True
             yield reader, writer
             break
 
-        except asyncio.CancelledError:
-            raise
-
         except (ConnectionRefusedError, ConnectionResetError):
             if connected:
-                await rf_writer("Соединение было разорвано")
+                await message_writer("Соединение было разорвано")
                 break
             if attempt >= ATTEMPTS_BEFORE_DELAY:
-                await rf_writer(f"Нет соединения. Повторная попытка через {ATTEMPT_DELAY_SECS} сек.")
+                await message_writer(f"Нет соединения. Повторная попытка через {ATTEMPT_DELAY_SECS} сек.")
                 await asyncio.sleep(ATTEMPT_DELAY_SECS)
                 continue
             attempt += 1
-            await rf_writer(f"Нет соединения. Повторная попытка.")
+            await message_writer(f"Нет соединения. Повторная попытка.")
 
         finally:
             if all((reader, writer)):
                 writer.close()
                 await writer.wait_closed()
-            await rf_writer("Соединение закрыто")
+            await message_writer("Соединение закрыто")
 
 
-async def echo_client(host, port, log_file_descriptor=None):
-    rf_writer = decorate_log_file_descriptor(log_file_descriptor)
+async def read_rows_from_server(rows_reader, message_writer):
     while True:
-        async with open_connection(host, port, rf_writer) as rw:
-            reader = rw[0]
+        row = await rows_reader.readline()
+        if not row:
+            break
+        await message_writer(f"{row.decode('utf8').strip()}")
+
+
+async def listen_chat(host, port, log_file_descriptor=None):
+    message_writer = decorate_log_file_descriptor(log_file_descriptor)
+    while True:
+        async with open_connection(host, port, message_writer) as rw:
+            reader, *_ = rw
             while True:
-                row = await reader.readline()
-                if not row:
-                    break
-                await rf_writer(f"{row.decode('utf8').strip()}")
+                await read_rows_from_server(reader, message_writer)
 
         await asyncio.sleep(ATTEMPT_DELAY_SECS)
 
@@ -88,7 +94,8 @@ async def main():
     conf = p.parse_args()
 
     async with aiofiles.open(DEFAULT_HISTORY_FILE, 'a', buffering=1) as log_file:
-        await asyncio.gather(echo_client(conf.host, conf.port, log_file))
+        await listen_chat(conf.host, conf.port, log_file)
+
 
 if __name__ == '__main__':
     asyncio.run(main())

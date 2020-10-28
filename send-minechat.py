@@ -6,7 +6,7 @@ import re
 import configargparse
 from aiofiles.os import wrap as aiowrap
 
-from utils import open_connection, decode_m
+from utils import open_connection, decode_message
 from utils import DEFAULT_SERVER_HOST, DEFAULT_SEND_SERVER_PORT
 
 ESCAPE_MESSAGE_PATTERN = re.compile('\n+')
@@ -19,9 +19,9 @@ def setup_logging(debug_mode):
 
 
 async def register(preferred_nickname, reader, writer, logger):
-    await logger(decode_m(await reader.readline()))
+    await logger(decode_message(await reader.readline()))
     writer.write("\n".encode())
-    await logger(decode_m(await reader.readline()))
+    await logger(decode_message(await reader.readline()))
     writer.write((preferred_nickname + "\n").encode())
     credentials = json.loads(await reader.readline())
     await logger(credentials)
@@ -29,10 +29,10 @@ async def register(preferred_nickname, reader, writer, logger):
 
 
 async def authorise(token, reader, writer, logger):
-    await logger(decode_m(await reader.readline()))
+    await logger(decode_message(await reader.readline()))
     writer.write(f"{token}\n".encode())
     response = json.loads(await reader.readline())
-    if response is None:
+    if not response:
         print("Unknown token. Check it, or register new user")
         return False
     await logger(response)
@@ -43,8 +43,30 @@ async def submit_message(message, reader, writer, logger):
     message = ESCAPE_MESSAGE_PATTERN.sub('\n', message)
     writer.write(f"{message}\n\n".encode())
     await logger(message)
-    await logger(decode_m(await reader.readline()))
+    await logger(decode_message(await reader.readline()))
     print("Message has been sent successfully")
+
+
+async def get_auth_token(host, port, nickname, logger):
+    async with open_connection(host, port, logger) as rw:
+        reader, writer = rw
+        credentials = await register(nickname, reader, writer, logger)
+        if not credentials:
+            print("Problems with new user registration. Try again later")
+            return
+        token = credentials['account_hash']
+        print(f"Save your token: {token}")
+        return token
+
+
+async def send_message(host, port, token, message, logger):
+    async with open_connection(host, port, logger) as rw:
+        reader, writer = rw
+        if await authorise(token, reader, writer, logger):
+            await logger(decode_message(await reader.readline()))
+            await submit_message(message, reader, writer, logger)
+        else:
+            print("Problems with authorization. Check your token")
 
 
 async def main():
@@ -60,23 +82,15 @@ async def main():
     conf = p.parse_args()
 
     logger = setup_logging(conf.debug)
+    token = conf.token
     if conf.nickname:
-        async with open_connection(DEFAULT_SERVER_HOST, DEFAULT_SEND_SERVER_PORT, logger) as rw:
-            reader, writer = rw
-            credentials = await register(conf.nickname, reader, writer, logger)
-            if not credentials:
-                print("Problems with new user registration. Try again later")
-                return
-            print(f"Save your token: {credentials['account_hash']}")
-            conf.token = credentials['account_hash']
+        token = await get_auth_token(conf.host, conf.port, conf.nickname, logger)
 
-    async with open_connection(DEFAULT_SERVER_HOST, DEFAULT_SEND_SERVER_PORT, logger) as rw:
-        reader, writer = rw
-        if await authorise(conf.token, reader, writer, logger):
-            await logger(decode_m(await reader.readline()))
-            await submit_message(conf.message, reader, writer, logger)
-        else:
-            print("Problems with authorization. Check your token")
+    if not token:
+        print("Empty token. Can't send message")
+        return
+
+    await send_message(conf.host, conf.port, token, conf.message, logger)
 
 
 if __name__ == '__main__':
